@@ -1,0 +1,16 @@
+{
+  "name": "KakaoTalk Theme Editor",
+  "short_name": "테마 에디터",
+  "start_url": "./preview.html",
+  "display": "standalone",
+  "background_color": "#F2F2F7",
+  "theme_color": "#F2F2F7",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

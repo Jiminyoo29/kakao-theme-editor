@@ -1,0 +1,1457 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KakaoTalk Theme Editor</title>
+  <!-- PWA / 홈화면 추가 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Theme Editor">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#F2F2F7">
+  <link rel="apple-touch-icon" sizes="180x180" href="icon.png">
+  <link rel="manifest" href="manifest.json">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.12.17/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { font-family: -apple-system, 'Inter', BlinkMacSystemFont, sans-serif; -webkit-font-smoothing: antialiased; background: #F2F2F7; }
+    ::-webkit-scrollbar { width: 0px; }
+    input[type='color'] { -webkit-appearance: none; padding:0; border:none; background:none; cursor:pointer; }
+    input[type='color']::-webkit-color-swatch-wrapper { padding:0; }
+    input[type='color']::-webkit-color-swatch { border:none; border-radius:0; }
+    input[type='text']:focus { outline: none; }
+    input[type='text'] { -webkit-appearance: none; }
+
+    @keyframes hl-pulse {
+      0%,100% { box-shadow: inset 0 0 0 2px #007AFF, inset 0 0 8px rgba(0,122,255,.20); }
+      50%      { box-shadow: inset 0 0 0 2px rgba(0,122,255,.6), inset 0 0 12px rgba(0,122,255,.10); }
+    }
+    @keyframes hl-enter {
+      0%   { box-shadow: inset 0 0 0 4px rgba(0,122,255,.8); }
+      100% { box-shadow: inset 0 0 0 2px #007AFF, inset 0 0 8px rgba(0,122,255,.20); }
+    }
+    .hl  { animation: hl-enter .18s ease-out, hl-pulse 1.4s ease-in-out .18s infinite; position:relative; z-index:4; border-radius:4px; }
+    .hli { display:inline-block; border-radius:4px; animation: hl-enter .18s ease-out, hl-pulse 1.4s ease-in-out .18s infinite; }
+
+    @keyframes toast-in {
+      from { opacity:0; transform:translateX(-50%) translateY(-6px); }
+      to   { opacity:1; transform:translateX(-50%) translateY(0); }
+    }
+    @keyframes slideUp {
+      from { transform:translateY(100%); }
+      to   { transform:translateY(0); }
+    }
+    .toast { animation: toast-in .15s ease-out forwards; }
+
+    .apple-row:hover { background: rgba(0,0,0,.03) !important; }
+    .apple-row.active-row { background: #EAF4FF !important; }
+    .divider { background: rgba(60,60,67,.15); transition: background .15s; }
+    .divider:hover, .divider.dragging { background: #007AFF !important; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="env,react">
+const { useState, useContext, createContext, useCallback, useEffect, useRef } = React;
+
+
+/* ── 유틸 ─────────────────────────────────────────────────────── */
+function hexToRgba(hex, alpha = 100) {
+  try {
+    const h = (hex || '#000000').replace('#','');
+    if (h.length !== 6) return hex;
+    const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+    const a = Math.max(0, Math.min(100, alpha)) / 100;
+    return a >= 1 ? hex : `rgba(${r},${g},${b},${a.toFixed(2)})`;
+  } catch { return hex; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   buildKtheme(name, colors) → Blob
+   실제 KakaoTalk iOS 테마 ZIP을 빌드합니다.
+   - KakaoTalkTheme.css  : 공식 CSS 셀렉터 + 속성
+   - Images/*.png        : Canvas로 생성한 말풍선 PNG (9-patch 방식)
+   ══════════════════════════════════════════════════════════════ */
+async function buildKtheme(name, colors) {
+  const c = colors;
+
+  /* 테마 ID: ASCII만 허용. 한글만 있으면 'mytheme' 사용 */
+  const safeId      = name.replace(/[^a-zA-Z0-9]/g,'').toLowerCase() || 'mytheme';
+  const bubbleRadius = typeof c.bubbleRadius === 'number' ? c.bubbleRadius : 20;
+  const headerAlpha  = typeof c.headerAlpha  === 'number' ? c.headerAlpha  : 100;
+
+  /* 색상 어둡게 (selected 상태용) */
+  function darken(hex, f=0.80) {
+    try {
+      const h = hex.replace('#','');
+      if (h.length !== 6) return hex;
+      const d = v => Math.max(0, Math.round(parseInt(v,16)*f)).toString(16).padStart(2,'0');
+      return '#' + d(h.slice(0,2)) + d(h.slice(2,4)) + d(h.slice(4,6));
+    } catch { return hex; }
+  }
+
+  /* 말풍선 PNG 생성 — scale: @1x/@2x/@3x
+     S = max(20, 2*bubbleRadius+20)*scale → 최소 20px 신축 영역 확보
+     R = bubbleRadius*scale → CSS cap insets와 동일한 반경 */
+  async function makeBubblePng(color, scale) {
+    const S = Math.max(20, 2 * bubbleRadius + 20) * scale;
+    const R = bubbleRadius * scale;
+    const cv = document.createElement('canvas');
+    cv.width = S; cv.height = S;
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0,0,S,S);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(R,0); ctx.lineTo(S-R,0); ctx.arcTo(S,0,S,R,R);
+    ctx.lineTo(S,S-R); ctx.arcTo(S,S,S-R,S,R);
+    ctx.lineTo(R,S); ctx.arcTo(0,S,0,S-R,R);
+    ctx.lineTo(0,R); ctx.arcTo(0,0,R,0,R);
+    ctx.closePath(); ctx.fill();
+    return new Promise(res => cv.toBlob(b => b.arrayBuffer().then(res), 'image/png'));
+  }
+
+  /* 4가지 색 × 3배율 = 12개 PNG 동시 생성 */
+  const [
+    sN1,sN2,sN3, sS1,sS2,sS3, rN1,rN2,rN3, rS1,rS2,rS3
+  ] = await Promise.all([
+    makeBubblePng(c.myBubbleBg,          1), makeBubblePng(c.myBubbleBg,          2), makeBubblePng(c.myBubbleBg,          3),
+    makeBubblePng(darken(c.myBubbleBg),  1), makeBubblePng(darken(c.myBubbleBg),  2), makeBubblePng(darken(c.myBubbleBg),  3),
+    makeBubblePng(c.otherBubbleBg,       1), makeBubblePng(c.otherBubbleBg,       2), makeBubblePng(c.otherBubbleBg,       3),
+    makeBubblePng(darken(c.otherBubbleBg),1),makeBubblePng(darken(c.otherBubbleBg),2),makeBubblePng(darken(c.otherBubbleBg),3),
+  ]);
+
+  /* CSS 생성 */
+  const css = `/* KakaoTalk iOS Theme — generated by Theme Editor */
+
+ManifestStyle {
+    -kakaotalk-theme-name: '${name.replace(/'/g,"\\'")}';
+    -kakaotalk-theme-version: '1.0';
+    -kakaotalk-theme-id: 'custom.theme.${safeId}';
+    -kakaotalk-author-name: 'Theme Editor';
+}
+
+TabBarStyle-Main {
+    background-color: ${c.tabBarBg};
+}
+
+HeaderStyle-Main {
+    background-color: ${hexToRgba(c.headerBg, headerAlpha)};
+    -ios-text-color: ${c.headerText};
+    -ios-tab-text-color: ${c.tabBarInactive};
+    -ios-tab-highlighted-text-color: ${c.tabBarActive};
+}
+
+MainViewStyle-Primary {
+    background-color: ${c.mainBg};
+    -ios-text-color: ${c.nameText};
+    -ios-description-text-color: ${c.timeText};
+    -ios-paragraph-text-color: ${c.timeText};
+    -ios-normal-background-color: ${c.mainBg};
+    -ios-selected-background-color: ${c.mainBg};
+}
+
+MainViewStyle-Secondary {
+    background-color: ${c.mainBg};
+}
+
+BackgroundStyle-ChatRoom {
+    background-color: ${c.chatBg};
+}
+
+InputBarStyle-Chat {
+    background-color: ${c.inputBg};
+    -ios-send-normal-background-color: ${c.inputBg};
+    -ios-send-normal-foreground-color: ${c.tabBarActive};
+    -ios-send-highlighted-background-color: ${c.inputBg};
+    -ios-send-highlighted-foreground-color: ${c.tabBarActive};
+    -ios-button-normal-foreground-color: ${c.tabBarInactive};
+    -ios-button-highlighted-foreground-color: ${c.tabBarActive};
+}
+
+/* 내 말풍선 — PNG 이미지로 색상 적용 (cap insets = bubbleRadius pt) */
+MessageCellStyle-Send {
+    -ios-background-image: 'chatroomBubbleSend01.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-selected-background-image: 'chatroomBubbleSend01Selected.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-group-background-image: 'chatroomBubbleSend02.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-group-selected-background-image: 'chatroomBubbleSend02Selected.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-title-edgeinsets: 10px 10px 7px 12px;
+    -ios-group-title-edgeinsets: 10px 10px 7px 12px;
+    -ios-text-color: ${c.myBubbleText};
+    -ios-selected-text-color: ${c.myBubbleText};
+    -ios-unread-text-color: ${c.readText};
+}
+
+/* 상대방 말풍선 */
+MessageCellStyle-Receive {
+    -ios-background-image: 'chatroomBubbleReceive01.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-selected-background-image: 'chatroomBubbleReceive01Selected.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-group-background-image: 'chatroomBubbleReceive02.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-group-selected-background-image: 'chatroomBubbleReceive02Selected.png' ${bubbleRadius}px ${bubbleRadius}px;
+    -ios-title-edgeinsets: 10px 10px 7px 10px;
+    -ios-group-title-edgeinsets: 10px 10px 7px 10px;
+    -ios-text-color: ${c.otherBubbleText};
+    -ios-selected-text-color: ${c.otherBubbleText};
+    -ios-unread-text-color: ${c.timeText};
+}
+
+BackgroundStyle-MessageNotificationBar { background-color: ${c.headerBg}; }
+LabelStyle-MessageNotificationBarName { -ios-text-color: ${c.nameText}; }
+LabelStyle-MessageNotificationBarMessage { -ios-text-color: ${c.timeText}; }
+BackgroundStyle-DirectShareBar { background-color: ${c.headerBg}; }
+LabelStyle-DirectShareBarName { -ios-text-color: ${c.nameText}; }
+LabelStyle-DirectShareBarMessage { -ios-text-color: ${c.timeText}; }
+
+/* 앱 잠금 화면 */
+BackgroundStyle-Passcode {
+    background-color: ${c.passcodeBg};
+}
+
+LabelStyle-PasscodeTitle {
+    -ios-text-color: ${c.passcodeTitle};
+}
+
+PasscodeStyle {
+    background-color: ${c.passcodePadBg};
+    -ios-text-color: ${c.passcodePadText};
+}
+`;
+
+  /* ZIP 빌드 — Images/ 폴더에 말풍선 PNG 8종 × 3배율(@1x/@2x/@3x) = 24개 포함
+     iOS는 기기 배율에 따라 자동으로 @2x / @3x 파일을 선택합니다.
+     (iPhone 16 Pro = @3x → @3x 파일 없으면 채팅방 적용 실패) */
+  const zip = new JSZip();
+  zip.file('KakaoTalkTheme.css', css);
+
+  const bubbleDefs = [
+    ['chatroomBubbleSend01',          sN1,sN2,sN3],
+    ['chatroomBubbleSend01Selected',  sS1,sS2,sS3],
+    ['chatroomBubbleSend02',          sN1,sN2,sN3],
+    ['chatroomBubbleSend02Selected',  sS1,sS2,sS3],
+    ['chatroomBubbleReceive01',         rN1,rN2,rN3],
+    ['chatroomBubbleReceive01Selected', rS1,rS2,rS3],
+    ['chatroomBubbleReceive02',         rN1,rN2,rN3],
+    ['chatroomBubbleReceive02Selected', rS1,rS2,rS3],
+  ];
+  for (const [n, b1,b2,b3] of bubbleDefs) {
+    zip.file(`Images/${n}.png`,    b1);
+    zip.file(`Images/${n}@2x.png`, b2);
+    zip.file(`Images/${n}@3x.png`, b3);
+  }
+
+  const raw = await zip.generateAsync({ type:'uint8array' });
+  return new Blob([raw], { type:'application/octet-stream' });
+}
+
+/* ── PNG 픽셀 샘플링 ─────────────────────────────────────────── */
+function samplePngColor(arrayBuffer) {
+  return new Promise(res => {
+    const blob = new Blob([arrayBuffer], { type:'image/png' });
+    const url  = URL.createObjectURL(blob);
+    const img  = new Image();
+    img.onload = () => {
+      try {
+        const cv = document.createElement('canvas');
+        cv.width = img.width; cv.height = img.height;
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(Math.floor(img.width/2), Math.floor(img.height/2), 1, 1).data;
+        res('#'+[d[0],d[1],d[2]].map(v=>v.toString(16).padStart(2,'0')).join(''));
+      } catch { res(null); }
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); res(null); };
+    img.src = url;
+  });
+}
+
+/* ── .ktheme 파일 파싱 ───────────────────────────────────────── */
+async function parseKtheme(file) {
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const cssFile = zip.file('KakaoTalkTheme.css');
+  if (!cssFile) throw new Error('KakaoTalkTheme.css를 찾을 수 없어요.');
+  const css = await cssFile.async('string');
+
+  function prop(sel, p) {
+    const sm = css.match(new RegExp(sel.replace(/[-]/g,'\\$&')+'\\s*\\{([^}]+)\\}','i'));
+    if (!sm) return null;
+    const pm = sm[1].match(new RegExp(p.replace(/[-]/g,'\\$&')+'\\s*:\\s*(#[0-9A-Fa-f]{6})','i'));
+    return pm ? pm[1] : null;
+  }
+
+  const c = {};
+  c.tabBarBg        = prop('TabBarStyle-Main',        'background-color');
+  c.headerBg        = prop('HeaderStyle-Main',         'background-color');
+  c.headerText      = prop('HeaderStyle-Main',         '-ios-text-color');
+  c.tabBarActive    = prop('HeaderStyle-Main',         '-ios-tab-highlighted-text-color');
+  c.tabBarInactive  = prop('HeaderStyle-Main',         '-ios-tab-text-color');
+  c.mainBg          = prop('MainViewStyle-Primary',    'background-color');
+  c.nameText        = prop('MainViewStyle-Primary',    '-ios-text-color');
+  c.timeText        = prop('MainViewStyle-Primary',    '-ios-description-text-color');
+  c.chatBg          = prop('BackgroundStyle-ChatRoom', 'background-color');
+  c.inputBg         = prop('InputBarStyle-Chat',       'background-color');
+  c.myBubbleText    = prop('MessageCellStyle-Send',    '-ios-text-color');
+  c.readText        = prop('MessageCellStyle-Send',    '-ios-unread-text-color');
+  c.otherBubbleText = prop('MessageCellStyle-Receive', '-ios-text-color');
+  c.passcodeBg      = prop('BackgroundStyle-Passcode', 'background-color');
+  c.passcodeTitle   = prop('LabelStyle-PasscodeTitle', '-ios-text-color');
+  c.passcodePadBg   = prop('PasscodeStyle',            'background-color');
+  c.passcodePadText = prop('PasscodeStyle',            '-ios-text-color');
+
+  try {
+    const f = zip.file('Images/chatroomBubbleSend01.png') || zip.file('Images/chatroomBubbleSend01@2x.png');
+    if (f) c.myBubbleBg = await samplePngColor(await f.async('arraybuffer'));
+  } catch(_) {}
+  try {
+    const f = zip.file('Images/chatroomBubbleReceive01.png') || zip.file('Images/chatroomBubbleReceive01@2x.png');
+    if (f) c.otherBubbleBg = await samplePngColor(await f.async('arraybuffer'));
+  } catch(_) {}
+
+  const rm = css.match(/-ios-background-image:\s*'chatroomBubbleSend01\.png'\s+([\d.]+)px/i);
+  if (rm) c.bubbleRadius = parseInt(rm[1]);
+
+  return Object.fromEntries(Object.entries(c).filter(([,v]) => v != null));
+}
+
+/* ── 카카오톡 기본 색상 ────────────────────────────────────────── */
+const DEFAULT_COLORS = {
+  mainBg:          '#F5F5F5',
+  chatBg:          '#B2C7D9',
+  myBubbleBg:      '#FFEB33',
+  myBubbleText:    '#191919',
+  readText:        '#FF9500',
+  otherBubbleBg:   '#FFFFFF',
+  otherBubbleText: '#191919',
+  headerBg:        '#FFFFFF',
+  headerText:      '#000000',
+  headerAlpha:     100,          /* 헤더 투명도 0~100 */
+  inputBg:         '#FFFFFF',
+  inputText:       '#000000',
+  tabBarBg:        '#FFFFFF',
+  tabBarActive:    '#3D1D1C',
+  tabBarInactive:  '#AAAAAA',
+  nameText:        '#3C3C3C',
+  timeText:        '#7A7A7A',
+  badgeBg:         '#FF3B30',
+  badgeText:       '#FFFFFF',
+  bubbleRadius:    20,           /* 말풍선 모서리 반경 0~50pt */
+  passcodeBg:      '#FFFFFF',   /* BackgroundStyle-Passcode */
+  passcodeTitle:   '#000000',   /* LabelStyle-PasscodeTitle */
+  passcodeDot:     '#000000',   /* 암호 입력 도트 색상 */
+  passcodePadBg:   '#F2F2F7',   /* PasscodeStyle background */
+  passcodePadText: '#000000',   /* PasscodeStyle text */
+};
+
+const PRESETS = [
+  { name:'카카오',   bubble:'#FFEB33', colors:{ ...DEFAULT_COLORS } },
+  { name:'iMessage', bubble:'#007AFF', colors:{ mainBg:'#F2F2F7', chatBg:'#FFFFFF', myBubbleBg:'#007AFF', myBubbleText:'#FFFFFF', readText:'#8E8E93', otherBubbleBg:'#E9E9EB', otherBubbleText:'#000000', headerBg:'#F9F9F9', headerText:'#000000', headerAlpha:100, inputBg:'#FFFFFF', inputText:'#000000', tabBarBg:'#F9F9F9', tabBarActive:'#007AFF', tabBarInactive:'#8E8E93', nameText:'#000000', timeText:'#8E8E93', badgeBg:'#FF3B30', badgeText:'#FFFFFF', bubbleRadius:18, passcodeBg:'#FFFFFF', passcodeTitle:'#000000', passcodeDot:'#000000', passcodePadBg:'#F2F2F7', passcodePadText:'#000000' } },
+  { name:'다크',     bubble:'#1E3A5F', colors:{ mainBg:'#000000', chatBg:'#1C1C1E', myBubbleBg:'#1E3A5F', myBubbleText:'#FFFFFF', readText:'#636366', otherBubbleBg:'#2C2C2E', otherBubbleText:'#FFFFFF', headerBg:'#1C1C1E', headerText:'#FFFFFF', headerAlpha:100, inputBg:'#2C2C2E', inputText:'#FFFFFF', tabBarBg:'#1C1C1E', tabBarActive:'#0A84FF', tabBarInactive:'#636366', nameText:'#FFFFFF', timeText:'#636366', badgeBg:'#FF453A', badgeText:'#FFFFFF', bubbleRadius:20, passcodeBg:'#000000', passcodeTitle:'#FFFFFF', passcodeDot:'#FFFFFF', passcodePadBg:'#1C1C1E', passcodePadText:'#FFFFFF' } },
+  { name:'파스텔',   bubble:'#FFB6C1', colors:{ mainBg:'#FFF0F5', chatBg:'#FFF0F5', myBubbleBg:'#FFB6C1', myBubbleText:'#5A2A33', readText:'#FF69B4', otherBubbleBg:'#FFFFFF', otherBubbleText:'#5A2A33', headerBg:'#FFE4E8', headerText:'#5A2A33', headerAlpha:100, inputBg:'#FFFFFF', inputText:'#5A2A33', tabBarBg:'#FFE4E8', tabBarActive:'#FF69B4', tabBarInactive:'#FFB6C1', nameText:'#5A2A33', timeText:'#FF9FB5', badgeBg:'#FF69B4', badgeText:'#FFFFFF', bubbleRadius:24, passcodeBg:'#FFF0F5', passcodeTitle:'#5A2A33', passcodeDot:'#FF69B4', passcodePadBg:'#FFE4E8', passcodePadText:'#5A2A33' } },
+  { name:'민트',     bubble:'#34C759', colors:{ mainBg:'#F0FFF4', chatBg:'#E8F8F0', myBubbleBg:'#34C759', myBubbleText:'#FFFFFF', readText:'#30A84B', otherBubbleBg:'#FFFFFF', otherBubbleText:'#1C1C1E', headerBg:'#F0FFF4', headerText:'#1C3A1C', headerAlpha:100, inputBg:'#FFFFFF', inputText:'#1C1C1E', tabBarBg:'#F0FFF4', tabBarActive:'#34C759', tabBarInactive:'#8E8E93', nameText:'#1C3A1C', timeText:'#8E8E93', badgeBg:'#34C759', badgeText:'#FFFFFF', bubbleRadius:20, passcodeBg:'#F0FFF4', passcodeTitle:'#1C3A1C', passcodeDot:'#34C759', passcodePadBg:'#E8F8F0', passcodePadText:'#1C3A1C' } },
+  { name:'올리브',   bubble:'#8B956D', colors:{ mainBg:'#F5F3EE', chatBg:'#EDE8DC', myBubbleBg:'#8B956D', myBubbleText:'#FFFFFF', readText:'#A09070', otherBubbleBg:'#FFFFFF', otherBubbleText:'#3D3A30', headerBg:'#F5F3EE', headerText:'#3D3A30', headerAlpha:100, inputBg:'#FFFFFF', inputText:'#3D3A30', tabBarBg:'#F5F3EE', tabBarActive:'#8B956D', tabBarInactive:'#B0A898', nameText:'#3D3A30', timeText:'#A09070', badgeBg:'#8B956D', badgeText:'#FFFFFF', bubbleRadius:20, passcodeBg:'#F5F3EE', passcodeTitle:'#3D3A30', passcodeDot:'#8B956D', passcodePadBg:'#EDE8DC', passcodePadText:'#3D3A30' } },
+];
+
+const SECTIONS = [
+  { title: '배경',          fields: [{ key:'mainBg',        label:'채팅 목록 배경'  },{ key:'chatBg',         label:'채팅방 배경'    }] },
+  { title: '내 말풍선',     fields: [{ key:'myBubbleBg',    label:'말풍선 배경'     },{ key:'myBubbleText',    label:'텍스트 색상'    },{ key:'readText',        label:'읽음 표시 색상' }] },
+  { title: '상대방 말풍선', fields: [{ key:'otherBubbleBg', label:'말풍선 배경'     },{ key:'otherBubbleText', label:'텍스트 색상'    }] },
+  { title: '말풍선 모양',   fields: [{ key:'bubbleRadius',  label:'모서리 반경',    type:'slider', min:0, max:50, unit:'pt' }] },
+  { title: '헤더',          fields: [{ key:'headerBg',      label:'헤더 배경'       },{ key:'headerText',      label:'텍스트/아이콘'  },{ key:'headerAlpha',     label:'헤더 투명도',   type:'slider', min:0, max:100, unit:'%' }] },
+  { title: '입력창',        fields: [{ key:'inputBg',       label:'입력창 배경'     },{ key:'inputText',       label:'텍스트 색상'    }] },
+  { title: '탭바',          fields: [{ key:'tabBarBg',      label:'탭바 배경'       },{ key:'tabBarActive',    label:'활성 아이콘'    },{ key:'tabBarInactive',  label:'비활성 아이콘'  }] },
+  { title: '텍스트',        fields: [{ key:'nameText',      label:'닉네임 색상'     },{ key:'timeText',        label:'시간 색상'      }] },
+  { title: '알림 배지',     fields: [{ key:'badgeBg',       label:'배지 배경'       },{ key:'badgeText',       label:'배지 숫자 색상' }] },
+  { title: '앱 잠금 화면', fields: [{ key:'passcodeBg',    label:'화면 배경색'     },{ key:'passcodeTitle',   label:'안내 텍스트 색상'},{ key:'passcodeDot',      label:'암호 도트 색상'  },{ key:'passcodePadBg',   label:'키패드 배경색'  },{ key:'passcodePadText', label:'키패드 숫자 색상'}] },
+];
+
+/* colorKey → { section, label, icon } 빠른 조회용 */
+const LABEL_MAP = Object.fromEntries(
+  SECTIONS.flatMap(s => s.fields.map(f => [f.key, { section: s.title, label: f.label }]))
+);
+
+const TAB_MAP = {
+  mainBg:'home',   chatBg:'chat',
+  myBubbleBg:'chat', myBubbleText:'chat', readText:'chat',
+  otherBubbleBg:'chat', otherBubbleText:'chat',
+  bubbleRadius:'chat',
+  headerBg:'chat', headerText:'chat', headerAlpha:'chat',
+  inputBg:'chat',  inputText:'chat',
+  tabBarBg:'home', tabBarActive:'home', tabBarInactive:'home',
+  nameText:'chat', timeText:'chat',
+  badgeBg:'home',  badgeText:'home',
+  passcodeBg:'passcode', passcodeTitle:'passcode', passcodeDot:'passcode', passcodePadBg:'passcode', passcodePadText:'passcode',
+};
+
+/* ── Context ──────────────────────────────────────────────────── */
+/* ── localStorage 헬퍼 ───────────────────────────────────────── */
+
+const STORAGE_KEY = 'kakao-theme-editor-v1';
+function getSaved() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+}
+function persistSaved(list) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch {}
+}
+
+const Ctx = createContext(null);
+function ThemeProvider({ children }) {
+  const [colors, setColors]   = useState({ ...DEFAULT_COLORS });
+  const [name,   setName]     = useState('나만의 테마');
+  const [activeKey, setAK]    = useState(null);
+  const [activeLabel, setAL]  = useState('');
+  const [saved, setSaved]     = useState(() => getSaved());
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const histRef = useRef([{ ...DEFAULT_COLORS }]);
+  const histIdx = useRef(0);
+
+  const set = useCallback((k, v) => {
+    setColors(p => {
+      const next = { ...p, [k]: v };
+      const stack = [...histRef.current.slice(0, histIdx.current + 1), next].slice(-100);
+      histRef.current = stack;
+      histIdx.current = stack.length - 1;
+      setCanUndo(histIdx.current > 0);
+      setCanRedo(false);
+      return next;
+    });
+  }, []);
+
+  const reset = useCallback(() => {
+    const c = { ...DEFAULT_COLORS };
+    setColors(c); setName('나만의 테마');
+    histRef.current = [c]; histIdx.current = 0;
+    setCanUndo(false); setCanRedo(false);
+  }, []);
+
+  const undo = useCallback(() => {
+    if (histIdx.current <= 0) return;
+    histIdx.current--;
+    setColors({ ...histRef.current[histIdx.current] });
+    setCanUndo(histIdx.current > 0); setCanRedo(true);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (histIdx.current >= histRef.current.length - 1) return;
+    histIdx.current++;
+    setColors({ ...histRef.current[histIdx.current] });
+    setCanUndo(true); setCanRedo(histIdx.current < histRef.current.length - 1);
+  }, []);
+
+  const loadColors = useCallback((newColors) => {
+    const c = { ...DEFAULT_COLORS, ...newColors };
+    setColors(c);
+    const stack = [...histRef.current.slice(0, histIdx.current + 1), c].slice(-100);
+    histRef.current = stack; histIdx.current = stack.length - 1;
+    setCanUndo(true); setCanRedo(false);
+  }, []);
+
+  const enter = useCallback((k,l) => { setAK(k); setAL(l); }, []);
+  const leave = useCallback(() => { setAK(null); setAL(''); }, []);
+
+  const saveTheme = useCallback((themeName, themeColors) => {
+    const item = { id: Date.now().toString(), name: themeName, colors: themeColors,
+      savedAt: new Date().toLocaleDateString('ko-KR') };
+    const next = [item, ...getSaved()];
+    persistSaved(next); setSaved(next);
+  }, []);
+
+  const loadSaved = useCallback((item) => {
+    loadColors(item.colors); setName(item.name);
+  }, [loadColors]);
+
+  const deleteSaved = useCallback((id) => {
+    const next = getSaved().filter(t => t.id !== id);
+    persistSaved(next); setSaved(next);
+  }, []);
+
+  const importTheme = useCallback(async (file) => {
+    try {
+      const extracted = await parseKtheme(file);
+      loadColors(extracted);
+      const n = file.name.replace(/\.ktheme$/i,'').replace(/_/g,' ');
+      if (n) setName(n);
+    } catch(e) { alert('파일을 불러오지 못했어요: ' + (e.message || '알 수 없는 오류')); }
+  }, [loadColors]);
+
+  return (
+    <Ctx.Provider value={{ colors, name, setName, set, reset, undo, redo, canUndo, canRedo,
+      loadColors, importTheme, activeKey, activeLabel, enter, leave,
+      saved, saveTheme, loadSaved, deleteSaved }}>
+      {children}
+    </Ctx.Provider>
+  );
+}
+const useTheme = () => useContext(Ctx);
+
+/* ── ColorRow ─────────────────────────────────────────────────── */
+function ColorRow({ colorKey, label, isLast, type, min, max, unit }) {
+  const { colors, set, activeKey, enter, leave } = useTheme();
+  const val = colors[colorKey];
+  const on  = activeKey === colorKey;
+  const baseStyle = { display:'flex', alignItems:'center', minHeight:44, padding:'8px 16px', background:'#fff', transition:'background .12s', borderBottom: isLast?'none':'0.5px solid rgba(60,60,67,.18)' };
+  const handlers  = { onMouseEnter:()=>enter(colorKey,label), onMouseLeave:leave, onFocus:()=>enter(colorKey,label), onBlur:leave };
+  const cls = `apple-row${on?' active-row':''}`;
+
+  if (type === 'slider') {
+    const n = typeof val === 'number' ? val : (min || 0);
+    return (
+      <div {...handlers} className={cls} style={baseStyle}>
+        <span style={{ flex:1, fontSize:15, color:'#000', whiteSpace:'nowrap', letterSpacing:-.1 }}>{label}</span>
+        <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
+          <input type="range" min={min} max={max} value={n}
+            onChange={e => set(colorKey, Number(e.target.value))}
+            style={{ width:90, accentColor:'#007AFF', cursor:'pointer' }} />
+          <span style={{ width:42, textAlign:'right', fontSize:13, color:on?'#007AFF':'#8E8E93', fontVariantNumeric:'tabular-nums' }}>{n}{unit}</span>
+        </div>
+      </div>
+    );
+  }
+
+  const hex   = typeof val === 'string' ? val : '#000000';
+  const valid = /^#[0-9A-Fa-f]{6}$/.test(hex);
+  return (
+    <div {...handlers} className={cls} style={baseStyle}>
+      <span style={{ flex:1, fontSize:15, color:'#000', whiteSpace:'nowrap', letterSpacing:-.1 }}>{label}</span>
+      <div style={{ display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+        <input type="text" maxLength={7} value={hex}
+          onChange={e=>{ const v=e.target.value; if(/^#[0-9A-Fa-f]{0,6}$/.test(v)) set(colorKey,v); }}
+          style={{ width:68, fontSize:13, color:on?'#007AFF':'#8E8E93', textAlign:'right', border:'none', background:'transparent', fontFamily:'ui-monospace, monospace', letterSpacing:'.02em', transition:'color .12s' }} />
+        <div style={{ width:28, height:28, borderRadius:8, flexShrink:0, cursor:'pointer', background:valid?hex:'#eee', boxShadow:on?'0 0 0 2px #007AFF, 0 0 0 4px rgba(0,122,255,.2)':'0 0 0 .5px rgba(0,0,0,.18) inset, 0 1px 3px rgba(0,0,0,.1)', position:'relative', overflow:'hidden', transition:'box-shadow .12s' }}>
+          <input type="color" value={valid?hex:'#000000'} onChange={e=>set(colorKey,e.target.value)}
+            style={{ position:'absolute', inset:0, width:'100%', height:'100%', opacity:0, cursor:'pointer' }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── SavedThemesList ─────────────────────────────────────────── */
+const SWATCH_KEYS = ['chatBg','myBubbleBg','otherBubbleBg','headerBg','tabBarBg'];
+function SavedThemesList({ onClose }) {
+  const { saved, loadSaved, deleteSaved } = useTheme();
+  const [confirmId, setConfirmId] = useState(null);
+
+  if (!saved.length) return (
+    <div style={{ padding:'32px 16px', textAlign:'center', color:'#8E8E93', fontSize:14 }}>
+      저장된 테마가 없어요.<br/>
+      <span style={{ fontSize:12, opacity:.7 }}>편집 화면에서 💾 저장 버튼을 눌러보세요.</span>
+    </div>
+  );
+
+  return (
+    <div>
+      {saved.map(t => (
+        <div key={t.id} style={{ margin:'0 16px 10px', background:'#fff', borderRadius:12, padding:'12px 14px', boxShadow:'0 1px 3px rgba(0,0,0,.07)' }}>
+          {/* 이름 + 날짜 */}
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+            <span style={{ fontSize:14, fontWeight:600, color:'#000', letterSpacing:-.2 }}>{t.name}</span>
+            <span style={{ fontSize:11, color:'#8E8E93' }}>{t.savedAt}</span>
+          </div>
+          {/* 색상 스와치 */}
+          <div style={{ display:'flex', gap:5, marginBottom:10 }}>
+            {SWATCH_KEYS.map(k => (
+              <div key={k} title={k} style={{ width:22, height:22, borderRadius:'50%', background: typeof t.colors[k]==='string' ? t.colors[k] : '#eee', boxShadow:'inset 0 0 0 1px rgba(0,0,0,.1)' }}/>
+            ))}
+          </div>
+          {/* 버튼 행 */}
+          {confirmId === t.id ? (
+            <div style={{ display:'flex', gap:6 }}>
+              <button onClick={() => { deleteSaved(t.id); setConfirmId(null); }} style={{ flex:1, padding:'7px 0', borderRadius:8, border:'none', background:'#FF3B30', color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit' }}>삭제 확인</button>
+              <button onClick={() => setConfirmId(null)} style={{ flex:1, padding:'7px 0', borderRadius:8, border:'none', background:'#E5E5EA', color:'#000', fontSize:13, fontWeight:500, cursor:'pointer', fontFamily:'inherit' }}>취소</button>
+            </div>
+          ) : (
+            <div style={{ display:'flex', gap:6 }}>
+              <button onClick={() => { loadSaved(t); onClose && onClose(); }} style={{ flex:1, padding:'7px 0', borderRadius:8, border:'none', background:'#007AFF', color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit' }}>불러오기</button>
+              <button onClick={() => setConfirmId(t.id)} style={{ padding:'7px 12px', borderRadius:8, border:'none', background:'#F2F2F7', color:'#FF3B30', fontSize:13, fontWeight:500, cursor:'pointer', fontFamily:'inherit' }}>삭제</button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+/* ── PresetPicker ────────────────────────────────────────────── */
+function PresetPicker() {
+  const { loadColors, setName } = useTheme();
+  return (
+    <div style={{ display:'flex', gap:6, padding:'4px 16px 0', overflowX:'auto' }}>
+      {PRESETS.map(p => (
+        <button key={p.name} onClick={() => { loadColors(p.colors); setName(p.name+' 테마'); }} style={{
+          flexShrink:0, display:'flex', alignItems:'center', gap:5,
+          padding:'5px 11px', borderRadius:99, border:'1px solid rgba(0,0,0,.12)',
+          background:'#fff', fontSize:12, fontWeight:500, cursor:'pointer', fontFamily:'inherit',
+          boxShadow:'0 1px 3px rgba(0,0,0,.06)',
+        }}>
+          <span style={{ width:10, height:10, borderRadius:'50%', background:p.bubble, flexShrink:0, boxShadow:'inset 0 0 0 1px rgba(0,0,0,.1)', display:'inline-block' }}/>
+          {p.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ── ControlPanel ─────────────────────────────────────────────── */
+function ControlPanel({ width }) {
+  const { name, setName, reset, colors, saveTheme, undo, redo, canUndo, canRedo, importTheme } = useTheme();
+
+  useEffect(() => {
+    const h = e => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+      if (e.key === 'z' &&  e.shiftKey) { e.preventDefault(); redo(); }
+      if (e.key === 'y')                { e.preventDefault(); redo(); }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [undo, redo]);
+  const [status, setStatus] = useState('idle');
+  const [tab, setTab] = useState('edit'); // 'edit' | 'saved'
+  const [saveFlash, setSaveFlash] = useState(false);
+
+  async function doExport() {
+    setStatus('busy');
+    try {
+      const blob = await buildKtheme(name, colors);
+      const url  = URL.createObjectURL(blob);
+      Object.assign(document.createElement('a'), { href:url, download:`${name.replace(/[^a-zA-Z0-9가-힣_-]/g,'_')}.ktheme` }).click();
+      URL.revokeObjectURL(url);
+      setStatus('done');
+    } catch(e) { console.error(e); setStatus('err'); }
+    setTimeout(() => setStatus('idle'), 2500);
+  }
+
+  function doSave() {
+    saveTheme(name, colors);
+    setSaveFlash(true);
+    setTimeout(() => setSaveFlash(false), 1800);
+  }
+
+  const SL = { fontSize:11, fontWeight:500, color:'#6D6D72', textTransform:'uppercase', letterSpacing:'.06em', padding:'16px 16px 4px' };
+
+  return (
+    <aside style={{ width, flexShrink:0, display:'flex', flexDirection:'column', background:'#F2F2F7', height:'100%', minWidth:220, overflow:'hidden' }}>
+      {/* 헤더 */}
+      <div style={{ padding:'20px 20px 8px', flexShrink:0 }}>
+        <div style={{ fontSize:26, fontWeight:700, color:'#000', letterSpacing:-.8 }}>Theme Editor</div>
+        <div style={{ fontSize:12, color:'#8E8E93', marginTop:2 }}>KakaoTalk Theme Builder</div>
+      </div>
+
+      {/* 탭 */}
+      <div style={{ display:'flex', margin:'0 16px 4px', background:'rgba(116,116,128,.18)', borderRadius:9, padding:2, flexShrink:0 }}>
+        {[['edit','편집'],['saved','저장됨']].map(([k,lbl]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            flex:1, padding:'6px 0', border:'none', borderRadius:7,
+            fontSize:12, fontWeight:500, cursor:'pointer', fontFamily:'inherit',
+            background: tab===k ? '#fff' : 'transparent',
+            color: tab===k ? '#000' : '#6D6D72',
+            boxShadow: tab===k ? '0 1px 4px rgba(0,0,0,.12)' : 'none',
+          }}>{lbl}</button>
+        ))}
+      </div>
+
+      {/* 콘텐츠 */}
+      <div style={{ flex:1, overflowY:'auto', paddingBottom:4 }}>
+        {tab === 'edit' ? (
+          <>
+            <div style={{ height:6 }}/>
+            <PresetPicker />
+            <div style={SL}>Theme Name</div>
+            <div style={{ margin:'0 16px', background:'#fff', borderRadius:10, overflow:'hidden' }}>
+              <input type="text" value={name} onChange={e=>setName(e.target.value)} placeholder="나만의 테마"
+                style={{ width:'100%', fontSize:15, padding:'12px 16px', border:'none', background:'transparent', color:'#000', fontFamily:'inherit', letterSpacing:-.1 }} />
+            </div>
+            {SECTIONS.map(s => (
+              <div key={s.title}>
+                <div style={SL}>{s.title}</div>
+                <div style={{ margin:'0 16px', background:'#fff', borderRadius:10, overflow:'hidden' }}>
+                  {s.fields.map((f,i) => <ColorRow key={f.key} colorKey={f.key} label={f.label} isLast={i===s.fields.length-1} type={f.type} min={f.min} max={f.max} unit={f.unit} />)}
+                </div>
+              </div>
+            ))}
+            <div style={{ height:8 }} />
+          </>
+        ) : (
+          <>
+            <div style={{ height:8 }} />
+            <SavedThemesList />
+          </>
+        )}
+      </div>
+
+      {/* 하단 버튼 */}
+      <div style={{ padding:'10px 16px 20px', borderTop:'0.5px solid rgba(60,60,67,.18)', flexShrink:0, display:'flex', flexDirection:'column', gap:8 }}>
+        {tab === 'edit' && (<>
+          <div style={{ display:'flex', gap:6 }}>
+            <button onClick={undo} disabled={!canUndo} style={{ flex:1, padding:'8px 0', borderRadius:10, border:'none', background:canUndo?'#E5E5EA':'#F8F8F8', color:canUndo?'#000':'#C7C7CC', fontSize:12, fontWeight:600, cursor:canUndo?'pointer':'default', fontFamily:'inherit' }}>↩ 실행취소</button>
+            <button onClick={redo} disabled={!canRedo} style={{ flex:1, padding:'8px 0', borderRadius:10, border:'none', background:canRedo?'#E5E5EA':'#F8F8F8', color:canRedo?'#000':'#C7C7CC', fontSize:12, fontWeight:600, cursor:canRedo?'pointer':'default', fontFamily:'inherit' }}>다시실행 ↪</button>
+          </div>
+          <div style={{ display:'flex', gap:6 }}>
+            <button onClick={doSave} style={{ flex:1, padding:'11px 0', borderRadius:12, border:saveFlash?'none':'1.5px solid #007AFF', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', letterSpacing:-.2, background:saveFlash?'#34C759':'#F2F2F7', color:saveFlash?'#fff':'#007AFF', transition:'all .2s' }}>
+              {saveFlash ? '✓ 저장됨!' : '💾 저장'}
+            </button>
+            <label style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', padding:'11px 0', borderRadius:12, border:'1.5px solid rgba(0,0,0,.15)', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', background:'#F2F2F7', color:'#3C3C43' }}>
+              📂 불러오기
+              <input type="file" accept=".ktheme" onChange={e=>{ if(e.target.files[0]) importTheme(e.target.files[0]); e.target.value=''; }} style={{ display:'none' }}/>
+            </label>
+          </div>
+        </>)}
+        <button onClick={doExport} disabled={status==='busy'} style={{
+          width:'100%', padding:'12px 0', borderRadius:12, border:'none',
+          fontSize:15, fontWeight:600, cursor:status==='busy'?'default':'pointer',
+          fontFamily:'inherit', letterSpacing:-.2, transition:'opacity .15s',
+          background: status==='done'?'#34C759': status==='err'?'#FF3B30': status==='busy'?'#adadad':'#007AFF',
+          color:'#fff', opacity:status==='busy'?.7:1,
+        }}>
+          {{ idle:'.ktheme 파일 다운로드', busy:'생성 중…', done:'✓ 다운로드 완료!', err:'오류 — 다시 시도' }[status]}
+        </button>
+        {tab === 'edit' && (
+          <button onClick={reset} style={{ width:'100%', padding:'7px 0', background:'none', border:'none', fontSize:13, color:'#FF3B30', cursor:'pointer', fontFamily:'inherit' }}>
+            기본값으로 초기화
+          </button>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+/* ── 상태바 ───────────────────────────────────────────────────── */
+function StatusBar({ bg, fg }) {
+  return (
+    <div style={{ height:44, background:bg, display:'flex', alignItems:'center', padding:'0 16px', justifyContent:'space-between', flexShrink:0 }}>
+      <span style={{ fontSize:15, fontWeight:700, color:fg, letterSpacing:-.4 }}>9:41</span>
+      <div style={{ display:'flex', gap:5, alignItems:'center', marginTop:1 }}>
+        <svg width="17" height="12" viewBox="0 0 17 12" fill={fg}>
+          <rect x="0" y="5" width="2.8" height="7" rx="1.1"/><rect x="4.5" y="3" width="2.8" height="9" rx="1.1"/>
+          <rect x="9" y="1" width="2.8" height="11" rx="1.1"/><rect x="13.5" y="0" width="2.8" height="12" rx="1.1" opacity=".3"/>
+        </svg>
+        <svg width="15" height="11" viewBox="0 0 15 11" fill={fg}>
+          <path d="M7.5 2.2C5.2 2.2 3.2 3.1 1.7 4.6L.4 3.3C2.3 1.2 4.8 0 7.5 0s5.2 1.2 7.1 3.3L13.3 4.6C11.8 3.1 9.8 2.2 7.5 2.2z"/>
+          <path d="M7.5 5.5c-1.5 0-2.9.6-3.9 1.6L2.3 5.8C3.7 4.4 5.5 3.5 7.5 3.5s3.8.9 5.2 2.3L11.4 7.1C10.4 6.1 9 5.5 7.5 5.5z"/>
+          <circle cx="7.5" cy="10" r="1.5"/>
+        </svg>
+        <div style={{ display:'flex', alignItems:'center', border:`1.3px solid ${fg}`, borderRadius:3, padding:'1.5px 2px', opacity:.9 }}>
+          <div style={{ width:20, height:9, background:fg, borderRadius:1.5 }}/>
+          <div style={{ width:2.5, height:5, background:fg, borderRadius:'0 1.5px 1.5px 0', marginLeft:.5, opacity:.4 }}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── 카카오톡 채팅방 미리보기 ────────────────────────────────── */
+function ChatPreview() {
+  const { colors:c, activeKey } = useTheme();
+  const hl  = (...k) => k.includes(activeKey) ? 'hl'  : '';
+  const hli = (...k) => k.includes(activeKey) ? 'hli' : '';
+  const hdrBg = hexToRgba(c.headerBg, c.headerAlpha ?? 100);
+  const bRadius = `${c.bubbleRadius ?? 20}px`;
+
+  /* 상대방 말풍선 */
+  const OtherBubble = ({ text, time, showAvatar, showName, name='김성현', reaction }) => (
+    <div style={{ display:'flex', gap:6, alignItems:'flex-start', marginBottom:1 }}>
+      <div style={{ width:32, flexShrink:0 }}>
+        {showAvatar && (
+          <div style={{ width:32, height:32, borderRadius:'50%', background:'#8E8E93', display:'flex', alignItems:'center', justifyContent:'center', fontSize:12, fontWeight:700, color:'#fff' }}>
+            {name[0]}
+          </div>
+        )}
+      </div>
+      <div style={{ maxWidth:200 }}>
+        {showName && <span className={hli('nameText')} style={{ fontSize:11, color:c.nameText, display:'block', marginBottom:3, fontWeight:500 }}>{name}</span>}
+        <div style={{ display:'flex', alignItems:'flex-end', gap:4 }}>
+          <div style={{ position:'relative' }}>
+            <div className={hl('otherBubbleBg','otherBubbleText','bubbleRadius')} style={{
+              background:c.otherBubbleBg, color:c.otherBubbleText,
+              padding:'9px 14px',
+              borderRadius:bRadius,
+              fontSize:14, lineHeight:1.45, wordBreak:'keep-all',
+              fontWeight:500,
+              boxShadow:'0 1px 4px rgba(0,0,0,.12)',
+            }}>{text}</div>
+            {reaction && <div style={{ position:'absolute', bottom:-11, right:-2, background:'#fff', borderRadius:99, border:'1px solid rgba(0,0,0,.1)', padding:'1px 5px', fontSize:11.5, boxShadow:'0 1px 4px rgba(0,0,0,.1)', zIndex:5 }}>{reaction}</div>}
+          </div>
+          {time && <span className={hli('timeText')} style={{ fontSize:10, color:c.timeText, flexShrink:0, whiteSpace:'nowrap', marginBottom:2 }}>{time}</span>}
+        </div>
+      </div>
+    </div>
+  );
+
+  /* 내 말풍선 */
+  const MyBubble = ({ text, readLabel, time }) => (
+    <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:1 }}>
+      <div style={{ display:'flex', alignItems:'flex-end', gap:4, maxWidth:230 }}>
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', justifyContent:'flex-end', flexShrink:0, gap:1 }}>
+          {readLabel && <span className={hli('readText')} style={{ fontSize:10, color:c.readText, fontWeight:700 }}>{readLabel}</span>}
+          {time && <span className={hli('timeText')} style={{ fontSize:10, color:c.timeText, whiteSpace:'nowrap' }}>{time}</span>}
+        </div>
+        <div className={hl('myBubbleBg','myBubbleText','bubbleRadius')} style={{
+          background:c.myBubbleBg, color:c.myBubbleText,
+          padding:'9px 14px',
+          borderRadius:bRadius,
+          fontSize:14, lineHeight:1.45, wordBreak:'keep-all',
+          fontWeight:500,
+          boxShadow:'0 1px 4px rgba(0,0,0,.14)',
+        }}>{text}</div>
+      </div>
+    </div>
+  );
+
+  const activeMeta = activeKey ? LABEL_MAP[activeKey] : null;
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
+      {/* 편집 중 항목 배지 */}
+      {activeMeta && (
+        <div style={{
+          position:'absolute', top:6, left:'50%', transform:'translateX(-50%)',
+          background:'rgba(0,0,0,.72)', backdropFilter:'blur(10px)',
+          color:'#fff', borderRadius:99, fontSize:10, fontWeight:600,
+          padding:'4px 10px', zIndex:50, pointerEvents:'none', whiteSpace:'nowrap',
+          display:'flex', alignItems:'center', gap:5, letterSpacing:-.1,
+        }}>
+          <span style={{ opacity:.7 }}>{activeMeta.section} ·</span>
+          <span>{activeMeta.label}</span>
+        </div>
+      )}
+      {/* 헤더 */}
+      <div className={hl('headerBg','headerText','headerAlpha')} style={{ flexShrink:0 }}>
+        <StatusBar bg={hdrBg} fg={c.headerText} />
+        <div style={{ display:'flex', alignItems:'center', height:46, padding:'0 12px', background:hdrBg, borderBottom:'0.5px solid rgba(0,0,0,.08)' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:2, minWidth:48 }}>
+            <svg width="9" height="15" viewBox="0 0 9 15" fill="none" stroke={c.headerText} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M7.5 1.5L1.5 7.5L7.5 13.5"/></svg>
+            <span style={{ fontSize:12, color:c.headerText, fontWeight:500 }}>1</span>
+          </div>
+          <div style={{ flex:1, textAlign:'center', fontSize:15, fontWeight:700, color:c.headerText, letterSpacing:-.3 }}>J</div>
+          <div style={{ display:'flex', gap:14, alignItems:'center', minWidth:48, justifyContent:'flex-end' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c.headerText} strokeWidth="2.2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c.headerText} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.61 3.4 2 2 0 0 1 3.6 1.22h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.8a16 16 0 0 0 6 6l.94-.94a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill={c.headerText}><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+          </div>
+        </div>
+      </div>
+
+      {/* 채팅 영역 */}
+      <div className={hl('chatBg')} style={{ flex:1, overflowY:'auto', padding:'10px 10px 6px', background:c.chatBg, display:'flex', flexDirection:'column' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8, margin:'2px 0 10px' }}>
+          <div style={{ flex:1, height:.5, background:'rgba(0,0,0,.18)' }}/>
+          <span style={{ fontSize:10.5, color:'rgba(0,0,0,.45)', fontWeight:500, whiteSpace:'nowrap', background:'rgba(0,0,0,.06)', padding:'2px 8px', borderRadius:99 }}>2025년 6월 9일 월요일</span>
+          <div style={{ flex:1, height:.5, background:'rgba(0,0,0,.18)' }}/>
+        </div>
+        <OtherBubble showAvatar={true} showName={true} name="J" text="오늘 우리 카톡 테마 만들자!" time="오전 10:23" />
+        <div style={{ height:10 }}/>
+        <MyBubble text="그래! 어떤 디자인으로 만들고싶어?" readLabel="읽음 1" time="10:24" />
+        <div style={{ height:10 }}/>
+        <OtherBubble showAvatar={true} showName={false} name="J" text="음 나는 imessage 처럼 깔끔한 느낌!" time="10:25" />
+        <div style={{ height:10 }}/>
+        <MyBubble text="한번 만들어보자!" time="10:26" />
+      </div>
+
+      {/* 입력창 */}
+      <div className={hl('inputBg','inputText')} style={{ background:c.inputBg, borderTop:'0.5px solid rgba(0,0,0,.1)', padding:'7px 8px 10px', flexShrink:0 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+          {/* + 버튼 (tabBarInactive) */}
+          <div style={{ width:30, height:30, borderRadius:'50%', border:`1.5px solid ${c.tabBarInactive}`, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+            <svg width="13" height="13" viewBox="0 0 13 13" stroke={c.tabBarInactive} strokeWidth="2" strokeLinecap="round"><line x1="6.5" y1="1" x2="6.5" y2="12"/><line x1="1" y1="6.5" x2="12" y2="6.5"/></svg>
+          </div>
+          {/* 입력 필드 — background:inputBg, text:inputText */}
+          <div className={hl('inputBg','inputText')} style={{ flex:1, background:c.inputBg, border:`1px solid rgba(0,0,0,.16)`, borderRadius:20, padding:'7px 12px', fontSize:13.5, color:c.inputText }}>
+            <span style={{ opacity:.4 }}>메시지 입력</span>
+          </div>
+          {/* 이모지 버튼 */}
+          <div style={{ width:28, height:28, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={c.tabBarInactive} strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+          </div>
+          {/* # 버튼 (텍스트 없을 때 기본 상태) */}
+          <div style={{ width:28, height:28, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={c.tabBarInactive} strokeWidth="2" strokeLinecap="round"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── 카카오톡 채팅 목록 미리보기 ─────────────────────────────── */
+const CHATS = [
+  { initial:'J',  name:'J',            msg:'한번 만들어보자!',             time:'오전 10:26', unread:0, isMine:true  },
+  { initial:'김', name:'김민지',      msg:'오늘 점심 뭐 먹었어?',        time:'9:15',       unread:3, isMine:false },
+  { initial:'이', name:'이준혁',      msg:'내일 약속 괜찮아?',           time:'어제',       unread:0, isMine:false },
+  { initial:'가', name:'가족 단톡방', msg:'엄마: 저녁은 뭐 먹을까?',     time:'어제',       unread:5, isMine:false },
+  { initial:'회', name:'회사 팀채널', msg:'내일 회의 10시로 변경됐어요',  time:'월요일',     unread:0, isMine:false },
+];
+
+function HomePreview() {
+  const { colors:c, activeKey } = useTheme();
+  const hl  = (...k) => k.includes(activeKey) ? 'hl'  : '';
+  const hli = (...k) => k.includes(activeKey) ? 'hli' : '';
+  const hdrBg = hexToRgba(c.headerBg, c.headerAlpha ?? 100);
+  const activeMeta = activeKey ? LABEL_MAP[activeKey] : null;
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
+      {/* 편집 중 항목 배지 */}
+      {activeMeta && (
+        <div style={{
+          position:'absolute', top:6, left:'50%', transform:'translateX(-50%)',
+          background:'rgba(0,0,0,.72)', backdropFilter:'blur(10px)',
+          color:'#fff', borderRadius:99, fontSize:10, fontWeight:600,
+          padding:'4px 10px', zIndex:50, pointerEvents:'none', whiteSpace:'nowrap',
+          display:'flex', alignItems:'center', gap:5, letterSpacing:-.1,
+        }}>
+          <span style={{ opacity:.7 }}>{activeMeta.section} ·</span>
+          <span>{activeMeta.label}</span>
+        </div>
+      )}
+      <div className={hl('headerBg','headerText','headerAlpha')} style={{ flexShrink:0 }}>
+        <StatusBar bg={hdrBg} fg={c.headerText} />
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'4px 14px 10px', background:hdrBg, borderBottom:'0.5px solid rgba(0,0,0,.08)' }}>
+          <span style={{ fontSize:18, fontWeight:700, color:c.headerText, letterSpacing:-.5 }}>채팅</span>
+          <div style={{ display:'flex', gap:16 }}>
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke={c.headerText} strokeWidth="2.2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke={c.headerText} strokeWidth="2.2" strokeLinecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke={c.headerText} strokeWidth="2.2" strokeLinecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </div>
+        </div>
+      </div>
+
+      {/* 필터 칩 행 */}
+      <div style={{ display:'flex', gap:6, padding:'6px 12px 8px', background:c.mainBg, flexShrink:0, overflowX:'auto' }}>
+        {[['전체',true],['그룹',false],['1:1',false],['오픈',false]].map(([lbl,active])=>(
+          <div key={lbl} style={{ flexShrink:0, padding:'4px 12px', borderRadius:99, fontSize:12, fontWeight:active?700:400, background:active?c.tabBarActive:'transparent', color:active?'#fff':c.nameText, border:`1px solid ${active?c.tabBarActive:'rgba(0,0,0,.15)'}` }}>{lbl}</div>
+        ))}
+      </div>
+
+      <div className={hl('mainBg')} style={{ flex:1, overflowY:'auto', background:c.mainBg }}>
+        {CHATS.map((f,i) => (
+          <div key={i} style={{ display:'flex', alignItems:'center', gap:10, padding:'9px 14px', borderBottom:'0.5px solid rgba(0,0,0,.07)' }}>
+            <div style={{ width:46, height:46, borderRadius:'50%', background:'#8E8E93', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:18, fontWeight:600, color:'#fff' }}>{f.initial}</div>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:3 }}>
+                <span className={hli('nameText')} style={{ fontSize:14, fontWeight:600, color:c.nameText, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{f.name}</span>
+                <span className={hli('timeText')} style={{ fontSize:11, color:c.timeText, flexShrink:0, marginLeft:6 }}>{f.time}</span>
+              </div>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <span style={{ fontSize:12.5, color:c.timeText, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', opacity:.85 }}>
+                  {f.isMine ? `나: ${f.msg}` : f.msg}
+                </span>
+                {f.unread > 0 && (
+                  <div className={hli('badgeBg')} style={{ minWidth:18, height:18, borderRadius:99, background:c.badgeBg, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, marginLeft:8, padding:'0 5px' }}>
+                    <span className={hli('badgeText')} style={{ fontSize:10.5, fontWeight:700, color:c.badgeText }}>{f.unread}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className={hl('tabBarBg','tabBarActive','tabBarInactive')} style={{ display:'flex', background:c.tabBarBg, borderTop:'0.5px solid rgba(0,0,0,.1)', padding:'6px 0 10px' }}>
+        {[
+          ['친구',  false, <svg width="22" height="22" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" fill="currentColor"/><path d="M4 20c0-3.3 3.6-6 8-6s8 2.7 8 6" fill="currentColor"/></svg>],
+          ['채팅',  true,  <svg width="22" height="22" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" fill="currentColor"/></svg>],
+          ['오픈채팅',false,<svg width="22" height="22" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2"/><polygon points="10,8 16,12 10,16" fill="currentColor"/></svg>],
+          ['쇼핑',  false, <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>],
+          ['더보기',false, <svg width="22" height="22" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>],
+        ].map(([lb,act,icon]) => (
+          <button key={lb} style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:2, background:'none', border:'none', cursor:'pointer', padding:0, color:act?c.tabBarActive:c.tabBarInactive }}>
+            {icon}
+            <span style={{ fontSize:9, fontWeight:act?700:400 }}>{lb}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── PasscodePreview — 앱 잠금 화면 미리보기 ─────────────────── */
+function PasscodePreview() {
+  const { colors:c, activeKey } = useTheme();
+  const hl = (...k) => k.includes(activeKey) ? 'hl' : '';
+  const activeMeta = activeKey ? LABEL_MAP[activeKey] : null;
+
+  const NUM_ROWS = [[1,2,3],[4,5,6],[7,8,9]];
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', height:'100%', position:'relative' }}>
+      {/* 편집 중 배지 */}
+      {activeMeta && (
+        <div style={{
+          position:'absolute', top:6, left:'50%', transform:'translateX(-50%)',
+          background:'rgba(0,0,0,.72)', backdropFilter:'blur(10px)',
+          color:'#fff', borderRadius:99, fontSize:10, fontWeight:600,
+          padding:'4px 10px', zIndex:50, pointerEvents:'none', whiteSpace:'nowrap',
+          display:'flex', alignItems:'center', gap:5, letterSpacing:-.1,
+        }}>
+          <span style={{ opacity:.7 }}>{activeMeta.section} ·</span>
+          <span>{activeMeta.label}</span>
+        </div>
+      )}
+
+      {/* 상단 영역 */}
+      <div className={hl('passcodeBg','passcodeTitle')} style={{
+        flex:1, display:'flex', flexDirection:'column',
+        alignItems:'center', justifyContent:'center',
+        background:c.passcodeBg, gap:14,
+      }}>
+        <StatusBar bg={c.passcodeBg} fg={c.passcodeTitle} />
+        <span style={{ fontSize:22, fontWeight:700, color:c.passcodeTitle, letterSpacing:-.4 }}>암호 입력</span>
+        <span style={{ fontSize:13, color:c.passcodeTitle, opacity:.55, letterSpacing:-.1 }}>카카오톡 암호를 입력해 주세요.</span>
+        {/* 입력 대시 4개 */}
+        <div className={hl('passcodeDot')} style={{ display:'flex', gap:22, marginTop:6 }}>
+          {[0,1,2,3].map(i => (
+            <div key={i} style={{
+              width:26, height:2, borderRadius:1,
+              background:c.passcodeDot,
+              opacity: i===0 ? 1 : 0.3,
+            }}/>
+          ))}
+        </div>
+      </div>
+
+      {/* 키패드 */}
+      <div className={hl('passcodePadBg','passcodePadText')} style={{
+        background:c.passcodePadBg, paddingBottom:14, flexShrink:0,
+      }}>
+        {NUM_ROWS.map((row, ri) => (
+          <div key={ri} style={{ display:'flex', justifyContent:'center' }}>
+            {row.map(k => (
+              <div key={k} style={{ width:102, height:72, display:'flex', alignItems:'center', justifyContent:'center' }}>
+                <span style={{ fontSize:28, fontWeight:300, color:c.passcodePadText }}>{k}</span>
+              </div>
+            ))}
+          </div>
+        ))}
+        {/* 마지막 행: FaceID | 0 | ⌫ */}
+        <div style={{ display:'flex', justifyContent:'center' }}>
+          {/* Face ID */}
+          <div style={{ width:102, height:72, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={c.passcodePadText} strokeWidth="1.4" strokeLinecap="round">
+              <path d="M7 3H5a2 2 0 0 0-2 2v2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+              <path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M17 21h2a2 2 0 0 0 2-2v-2"/>
+              <path d="M9 10h.01"/><path d="M15 10h.01"/>
+              <path d="M9.5 15a3.5 3.5 0 0 0 5 0"/>
+            </svg>
+          </div>
+          {/* 0 */}
+          <div style={{ width:102, height:72, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <span style={{ fontSize:28, fontWeight:300, color:c.passcodePadText }}>0</span>
+          </div>
+          {/* ⌫ */}
+          <div style={{ width:102, height:72, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <svg width="26" height="20" viewBox="0 0 26 20" fill="none" stroke={c.passcodePadText} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 1L1 10l8 9h15V1H9z"/>
+              <line x1="14" y1="7" x2="20" y2="13"/>
+              <line x1="20" y1="7" x2="14" y2="13"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── PhoneFrame — 공유 iPhone 16 Pro 프레임 컴포넌트 ────────── */
+function PhoneFrame({ tab }) {
+  const SW=307, SH=655, BL=11, BT=12, BB=33;
+  const FW = SW + BL*2;
+  const FH = SH + BT + BB;
+  return (
+    <div style={{ position:'relative', width:FW, height:FH, flexShrink:0 }}>
+      {/* 1. 앱 콘텐츠 */}
+      <div style={{ position:'absolute', top:BT, left:BL, width:SW, height:SH, borderRadius:44, overflow:'hidden', zIndex:1, background:'#fff' }}>
+        {tab === 'passcode' ? <PasscodePreview /> : tab === 'chat' ? <ChatPreview /> : <HomePreview />}
+      </div>
+      {/* 2. SVG 프레임 오버레이 */}
+      <svg width={FW} height={FH} viewBox={`0 0 ${FW} ${FH}`} fill="none"
+        style={{ position:'absolute', top:0, left:0, zIndex:10, pointerEvents:'none' }}>
+        <defs>
+          <linearGradient id="frameV" x1="0" y1="0" x2="0" y2={FH} gradientUnits="userSpaceOnUse">
+            <stop offset="0%"   stopColor="#4A4A4E"/>
+            <stop offset="18%"  stopColor="#2C2C2E"/>
+            <stop offset="50%"  stopColor="#1C1C1E"/>
+            <stop offset="82%"  stopColor="#2C2C2E"/>
+            <stop offset="100%" stopColor="#4A4A4E"/>
+          </linearGradient>
+          <linearGradient id="leftSheen" x1="0" y1="0" x2="1" y2="0" gradientUnits="userSpaceOnUse">
+            <stop offset="0%"   stopColor="rgba(255,255,255,0.18)"/>
+            <stop offset="100%" stopColor="rgba(255,255,255,0)"/>
+          </linearGradient>
+          <linearGradient id="rightSheen" x1={FW} y1="0" x2={FW-4} y2="0" gradientUnits="userSpaceOnUse">
+            <stop offset="0%"  stopColor="rgba(0,0,0,0.45)"/>
+            <stop offset="100%" stopColor="rgba(0,0,0,0)"/>
+          </linearGradient>
+        </defs>
+        <path fillRule="evenodd" fill="url(#frameV)"
+          d={`M 52,0 L ${FW-52},0 Q ${FW},0 ${FW},52 L ${FW},${FH-52} Q ${FW},${FH} ${FW-52},${FH} L 52,${FH} Q 0,${FH} 0,${FH-52} L 0,52 Q 0,0 52,0 Z M ${BL+44},${BT} L ${BL+SW-44},${BT} Q ${BL+SW},${BT} ${BL+SW},${BT+44} L ${BL+SW},${BT+SH-44} Q ${BL+SW},${BT+SH} ${BL+SW-44},${BT+SH} L ${BL+44},${BT+SH} Q ${BL},${BT+SH} ${BL},${BT+SH-44} L ${BL},${BT+44} Q ${BL},${BT} ${BL+44},${BT} Z`}
+        />
+        <rect x="0" y="80" width="4" height={FH-160} rx="2" fill="url(#leftSheen)"/>
+        <rect x={FW-4} y="80" width="4" height={FH-160} rx="2" fill="url(#rightSheen)"/>
+        <path fillRule="evenodd" fill="none" stroke="rgba(255,255,255,0.11)" strokeWidth="1"
+          d={`M 52,.5 L ${FW-52},.5 Q ${FW-.5},.5 ${FW-.5},52 L ${FW-.5},${FH-52} Q ${FW-.5},${FH-.5} ${FW-52},${FH-.5} L 52,${FH-.5} Q .5,${FH-.5} .5,${FH-52} L .5,52 Q .5,.5 52,.5 Z`}
+        />
+        {/* 버튼 */}
+        <rect x="-4.5" y="105" width="6" height="30" rx="3" fill="#3A3A3C"/>
+        <rect x="-4.5" y="105" width="3" height="30" rx="1.5" fill="rgba(255,255,255,0.07)"/>
+        <rect x="-4.5" y="148" width="6" height="50" rx="3" fill="#3A3A3C"/>
+        <rect x="-4.5" y="148" width="3" height="50" rx="1.5" fill="rgba(255,255,255,0.07)"/>
+        <rect x="-4.5" y="208" width="6" height="50" rx="3" fill="#3A3A3C"/>
+        <rect x="-4.5" y="208" width="3" height="50" rx="1.5" fill="rgba(255,255,255,0.07)"/>
+        <rect x={FW-1.5} y="162" width="6" height="78" rx="3" fill="#3A3A3C"/>
+        <rect x={FW-1.5} y="162" width="3" height="78" rx="1.5" fill="rgba(255,255,255,0.07)"/>
+        {/* 하단 디테일 */}
+        <rect x={FW/2-56} y={FH-22} width="112" height="5" rx="2.5" fill="rgba(255,255,255,0.26)"/>
+        <rect x={FW/2-24} y={FH-9} width="48" height="6" rx="3" fill="#111"/>
+        <rect x={FW/2-21} y={FH-8} width="42" height="4" rx="2" fill="#0A0A0A"/>
+        {[0,1,2,3].map(i => <rect key={i} x={FW/2-17+i*9} y={FH-7.5} width="5" height="2" rx="1" fill="#1C1C1E"/>)}
+        {[0,1,2,3].map(i => <circle key={`sl${i}`} cx={75+i*8} cy={FH-6} r="1.5" fill="#111"/>)}
+        {[0,1,2,3].map(i => <circle key={`sr${i}`} cx={FW-75-i*8} cy={FH-6} r="1.5" fill="#111"/>)}
+      </svg>
+    </div>
+  );
+}
+
+/* ── PreviewPanel — 데스크톱 ─────────────────────────────────── */
+function PreviewPanel() {
+  const [tab, setTab]              = useState('chat');
+  const { activeKey, activeLabel } = useTheme();
+
+  useEffect(() => {
+    if (activeKey && TAB_MAP[activeKey]) setTab(TAB_MAP[activeKey]);
+  }, [activeKey]);
+
+  return (
+    <main style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'12px 40px', gap:12, background:'#E5E5EA', overflow:'auto', position:'relative' }}>
+
+      {/* 수정 중 토스트 */}
+      {activeKey && (
+        <div key={activeKey} className="toast" style={{
+          position:'absolute', top:14, left:'50%', transform:'translateX(-50%)',
+          background:'rgba(28,28,30,.9)', backdropFilter:'blur(12px)',
+          color:'#fff', fontSize:12, fontWeight:500, padding:'6px 14px', borderRadius:99,
+          display:'flex', alignItems:'center', gap:7,
+          boxShadow:'0 4px 16px rgba(0,0,0,.22)',
+          whiteSpace:'nowrap', zIndex:100, letterSpacing:-.1, pointerEvents:'none',
+        }}>
+          <span style={{ width:6, height:6, borderRadius:'50%', background:'#FFCA28', display:'inline-block', flexShrink:0 }}/>
+          수정 중 — {activeLabel}
+        </div>
+      )}
+
+      {/* 세그먼트 컨트롤 */}
+      <div style={{ display:'flex', background:'rgba(116,116,128,.18)', borderRadius:9, padding:2, flexShrink:0 }}>
+        {[['passcode','잠금 화면'],['home','채팅 목록'],['chat','채팅방']].map(([k,lbl]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            padding:'5px 16px', border:'none', borderRadius:7,
+            fontSize:13, fontWeight:500, cursor:'pointer', fontFamily:'inherit',
+            letterSpacing:-.2, transition:'all .15s',
+            background: tab===k ? '#fff' : 'transparent',
+            color: tab===k ? '#000' : '#6D6D72',
+            boxShadow: tab===k ? '0 1px 4px rgba(0,0,0,.12)' : 'none',
+          }}>{lbl}</button>
+        ))}
+      </div>
+
+      <PhoneFrame tab={tab} />
+    </main>
+  );
+}
+
+/* ── useIsMobile ──────────────────────────────────────────────── */
+function useIsMobile() {
+  const [mobile, setMobile] = useState(() => window.innerWidth < 768);
+  useEffect(() => {
+    const h = () => setMobile(window.innerWidth < 768);
+    window.addEventListener('resize', h);
+    return () => window.removeEventListener('resize', h);
+  }, []);
+  return mobile;
+}
+
+/* ── 모바일 레이아웃 ─────────────────────────────────────────── */
+function MobileApp() {
+  const [page, setPage] = useState('edit'); // 'edit' | 'saved' | 'preview'
+  const [peekOpen, setPeekOpen] = useState(false);
+  const { name, reset, colors, saveTheme, undo, redo, canUndo, canRedo, importTheme } = useTheme();
+  const [saveFlash, setSaveFlash] = useState(false);
+
+  function doSave() {
+    saveTheme(name, colors);
+    setSaveFlash(true);
+    setTimeout(() => setSaveFlash(false), 1800);
+  }
+  const [status, setStatus] = useState('idle');
+
+  async function doExport() {
+    setStatus('busy');
+    try {
+      const blob = await buildKtheme(name, colors);
+      const url  = URL.createObjectURL(blob);
+      Object.assign(document.createElement('a'), { href:url, download:`${name.replace(/[^a-zA-Z0-9가-힣_-]/g,'_')}.ktheme` }).click();
+      URL.revokeObjectURL(url);
+      setStatus('done');
+    } catch(e) { console.error(e); setStatus('err'); }
+    setTimeout(() => setStatus('idle'), 2500);
+  }
+
+  const SL = { fontSize:11, fontWeight:600, color:'#6D6D72', textTransform:'uppercase', letterSpacing:'.06em', padding:'16px 16px 4px' };
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', height:'100dvh', background:'#F2F2F7', overflow:'hidden' }}>
+      {/* 상단 헤더 */}
+      <div style={{ padding:'16px 16px 10px', background:'#F2F2F7', flexShrink:0, paddingTop:'max(16px, env(safe-area-inset-top, 16px))' }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div>
+            <div style={{ fontSize:22, fontWeight:700, color:'#000', letterSpacing:-.6 }}>Theme Editor</div>
+            <div style={{ fontSize:12, color:'#8E8E93', marginTop:1 }}>KakaoTalk Theme Builder</div>
+          </div>
+          <div style={{ display:'flex', gap:5, alignItems:'center' }}>
+            <button onClick={undo} disabled={!canUndo} style={{ padding:'8px 10px', borderRadius:10, border:'none', fontSize:15, cursor:canUndo?'pointer':'default', background:'#E5E5EA', color:canUndo?'#000':'#C7C7CC', fontFamily:'inherit' }}>↩</button>
+            <button onClick={redo} disabled={!canRedo} style={{ padding:'8px 10px', borderRadius:10, border:'none', fontSize:15, cursor:canRedo?'pointer':'default', background:'#E5E5EA', color:canRedo?'#000':'#C7C7CC', fontFamily:'inherit' }}>↪</button>
+            <label style={{ padding:'8px 10px', borderRadius:10, fontSize:15, cursor:'pointer', background:'#E5E5EA', color:'#3C3C43', display:'flex', alignItems:'center', justifyContent:'center' }}>
+              📂<input type="file" accept=".ktheme" onChange={e=>{ if(e.target.files[0]) importTheme(e.target.files[0]); e.target.value=''; }} style={{ display:'none' }}/>
+            </label>
+            <button onClick={doExport} disabled={status==='busy'} style={{ padding:'8px 12px', borderRadius:10, border:'none', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', background:status==='done'?'#34C759':status==='err'?'#FF3B30':status==='busy'?'#aaa':'#007AFF', color:'#fff' }}>
+              {{ idle:'⬇', busy:'…', done:'✓', err:'!' }[status]}
+            </button>
+            <button onClick={doSave} style={{ padding:'8px 10px', borderRadius:10, border:'none', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'inherit', background:saveFlash?'#34C759':'#F2F2F7', color:saveFlash?'#fff':'#007AFF', transition:'all .2s' }}>
+              {saveFlash ? '✓' : '💾'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 컨텐츠 영역 */}
+      <div style={{ flex:1, overflow:'hidden', position:'relative' }}>
+        {/* 편집 탭 */}
+        <div style={{ position:'absolute', inset:0, overflowY:'auto', display: page==='edit' ? 'block' : 'none' }}>
+          <div style={{ height:6 }}/>
+          <PresetPicker />
+          <div style={SL}>Theme Name</div>
+          <MobileNameInput />
+          {SECTIONS.map(s => (
+            <div key={s.title}>
+              <div style={SL}>{s.title}</div>
+              <div style={{ margin:'0 16px', background:'#fff', borderRadius:10, overflow:'hidden' }}>
+                {s.fields.map((f,i) => <ColorRow key={f.key} colorKey={f.key} label={f.label} isLast={i===s.fields.length-1} type={f.type} min={f.min} max={f.max} unit={f.unit} />)}
+              </div>
+            </div>
+          ))}
+          <button onClick={reset} style={{ display:'block', width:'calc(100% - 32px)', margin:'12px 16px 8px', padding:'10px', background:'none', border:'none', fontSize:13, color:'#FF3B30', cursor:'pointer', fontFamily:'inherit' }}>
+            기본값으로 초기화
+          </button>
+          <div style={{ height:'max(20px, env(safe-area-inset-bottom, 20px))' }}/>
+        </div>
+
+        {/* 저장된 테마 탭 */}
+        <div style={{ position:'absolute', inset:0, overflowY:'auto', display: page==='saved' ? 'block' : 'none', background:'#F2F2F7' }}>
+          <div style={{ height:8 }}/>
+          <SavedThemesList onClose={() => setPage('edit')} />
+          <div style={{ height:'max(20px, env(safe-area-inset-bottom, 20px))' }}/>
+        </div>
+
+        {/* 미리보기 탭 */}
+        <div style={{ position:'absolute', inset:0, overflowY:'auto', display: page==='preview' ? 'flex' : 'none', flexDirection:'column', alignItems:'center', background:'#E5E5EA', padding:'12px 12px 0' }}>
+          <MobilePreview />
+          <div style={{ height:'max(20px, env(safe-area-inset-bottom, 20px))' }}/>
+        </div>
+      </div>
+
+      {/* 하단 탭바 */}
+      <div style={{ display:'flex', background:'rgba(249,249,249,0.94)', backdropFilter:'blur(20px)', borderTop:'0.5px solid rgba(60,60,67,.2)', flexShrink:0, paddingBottom:'max(8px, env(safe-area-inset-bottom, 8px))' }}>
+        {[['edit','✏️','편집'],['saved','💾','저장됨'],['preview','📱','미리보기']].map(([k,ic,lbl]) => (
+          <button key={k} onClick={() => setPage(k)} style={{
+            flex:1, display:'flex', flexDirection:'column', alignItems:'center', padding:'8px 0 4px',
+            background:'none', border:'none', cursor:'pointer', gap:2,
+          }}>
+            <span style={{ fontSize:22 }}>{ic}</span>
+            <span style={{ fontSize:10, fontWeight:page===k?600:400, color:page===k?'#007AFF':'#8E8E93', letterSpacing:-.2 }}>{lbl}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* FAB — 편집 중 미리보기 버튼 */}
+      {page === 'edit' && (
+        <button onClick={() => setPeekOpen(true)} style={{
+          position:'fixed', bottom:80, right:16,
+          width:50, height:50, borderRadius:25,
+          background:'#007AFF', border:'none', cursor:'pointer',
+          boxShadow:'0 4px 14px rgba(0,122,255,.45)',
+          display:'flex', alignItems:'center', justifyContent:'center',
+          fontSize:22, zIndex:200,
+          WebkitTapHighlightColor:'transparent',
+        }} aria-label="미리보기">
+          👁
+        </button>
+      )}
+
+      {/* 바텀시트 — 편집 중 미리보기 오버레이 */}
+      {peekOpen && (
+        <div style={{
+          position:'fixed', inset:0, zIndex:300,
+          display:'flex', flexDirection:'column', justifyContent:'flex-end',
+        }}>
+          {/* 딤 배경 — 탭하면 닫힘 */}
+          <div onClick={() => setPeekOpen(false)} style={{
+            position:'absolute', inset:0, background:'rgba(0,0,0,.45)',
+          }} />
+          {/* 시트 본체 */}
+          <div style={{
+            position:'relative', background:'#E5E5EA',
+            borderRadius:'20px 20px 0 0',
+            maxHeight:'88dvh', overflowY:'auto',
+            paddingBottom:'max(16px, env(safe-area-inset-bottom, 16px))',
+            animation:'slideUp .25s ease',
+          }}>
+            {/* 핸들 */}
+            <div style={{ display:'flex', justifyContent:'center', padding:'10px 0 4px' }}>
+              <div style={{ width:36, height:4, borderRadius:2, background:'rgba(60,60,67,.3)' }} />
+            </div>
+            {/* 닫기 버튼 */}
+            <div style={{ display:'flex', justifyContent:'flex-end', padding:'0 16px 8px' }}>
+              <button onClick={() => setPeekOpen(false)} style={{
+                background:'rgba(116,116,128,.18)', border:'none', borderRadius:99,
+                fontSize:12, fontWeight:600, color:'#3C3C43', padding:'4px 12px',
+                cursor:'pointer', fontFamily:'inherit',
+              }}>닫기</button>
+            </div>
+            <MobilePreview />
+            <div style={{ height:8 }} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* 모바일 이름 입력 (Context 접근용 별도 컴포넌트) */
+function MobileNameInput() {
+  const { name, setName } = useTheme();
+  return (
+    <div style={{ margin:'0 16px', background:'#fff', borderRadius:10, overflow:'hidden', marginTop: -10 }}>
+      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="나만의 테마"
+        style={{ width:'100%', fontSize:15, padding:'12px 16px', border:'none', background:'transparent', color:'#000', fontFamily:'inherit', letterSpacing:-.1 }} />
+    </div>
+  );
+}
+
+/* 모바일 미리보기: 세그먼트 컨트롤 + 스케일된 폰 프레임 */
+function MobilePreview() {
+  const [tab, setTab] = useState('chat');
+  const { activeKey } = useTheme();
+  const [vw, setVw]   = useState(window.innerWidth);
+
+  useEffect(() => {
+    if (activeKey && TAB_MAP[activeKey]) setTab(TAB_MAP[activeKey]);
+  }, [activeKey]);
+
+  useEffect(() => {
+    const h = () => setVw(window.innerWidth);
+    window.addEventListener('resize', h);
+    return () => window.removeEventListener('resize', h);
+  }, []);
+
+  const FW = 329, FH = 700;
+  const avail = Math.min(vw - 24, 380);      // 좌우 패딩 12px씩
+  const scale = Math.min(1, avail / FW);
+  const scaledH = FH * scale;
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:10, width:'100%' }}>
+      {/* 세그먼트 컨트롤 */}
+      <div style={{ display:'flex', background:'rgba(116,116,128,.18)', borderRadius:9, padding:2, flexShrink:0 }}>
+        {[['passcode','잠금 화면'],['home','채팅 목록'],['chat','채팅방']].map(([k,lbl]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            padding:'5px 14px', border:'none', borderRadius:7,
+            fontSize:12, fontWeight:500, cursor:'pointer', fontFamily:'inherit',
+            background: tab===k ? '#fff' : 'transparent',
+            color: tab===k ? '#000' : '#6D6D72',
+            boxShadow: tab===k ? '0 1px 4px rgba(0,0,0,.12)' : 'none',
+          }}>{lbl}</button>
+        ))}
+      </div>
+
+      {/* 스케일된 폰 프레임 */}
+      <div style={{ width: FW*scale, height: scaledH, flexShrink:0 }}>
+        <div style={{ width:FW, height:FH, transform:`scale(${scale})`, transformOrigin:'top left' }}>
+          <PhoneFrame tab={tab} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── App — 데스크톱: 좌우 드래그 조절 ───────────────────────── */
+function App() {
+  const isMobile = useIsMobile();
+  const [leftWidth, setLeftWidth] = useState(292);
+  const isDragging = useRef(false);
+  const dragStartX = useRef(0);
+  const dragStartW = useRef(292);
+  const dividerRef = useRef(null);
+
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!isDragging.current) return;
+      const next = Math.max(220, Math.min(520, dragStartW.current + (e.clientX - dragStartX.current)));
+      setLeftWidth(next);
+    };
+    const onUp = () => {
+      if (!isDragging.current) return;
+      isDragging.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      if (dividerRef.current) dividerRef.current.classList.remove('dragging');
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, []);
+
+  const startDrag = (e) => {
+    isDragging.current = true;
+    dragStartX.current = e.clientX;
+    dragStartW.current = leftWidth;
+    document.body.style.cursor    = 'col-resize';
+    document.body.style.userSelect = 'none';
+    if (dividerRef.current) dividerRef.current.classList.add('dragging');
+    e.preventDefault();
+  };
+
+  if (isMobile) {
+    return (
+      <ThemeProvider>
+        <MobileApp />
+      </ThemeProvider>
+    );
+  }
+
+  return (
+    <ThemeProvider>
+      <div style={{ display:'flex', height:'100vh', overflow:'hidden' }}>
+        <ControlPanel width={leftWidth} />
+        <div ref={dividerRef} onMouseDown={startDrag} className="divider"
+          style={{ width:5, flexShrink:0, cursor:'col-resize', zIndex:10, display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+            {[0,1,2,3].map(i => <div key={i} style={{ width:2, height:2, borderRadius:1, background:'rgba(255,255,255,.5)' }}/>)}
+          </div>
+        </div>
+        <PreviewPanel />
+      </div>
+    </ThemeProvider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
